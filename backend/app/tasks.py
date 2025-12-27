@@ -44,6 +44,10 @@ def update_job_status(
 
 def api_call_with_retry(client, job_id, system_prompt, user_content, max_tokens=4000, max_retries=5):
     """Helper function to make OpenAI API calls with retry logic for rate limiting."""
+    # Detect critical instructions in user content and reinforce system prompt
+    if "CRITICAL - MUST FOLLOW" in user_content:
+        system_prompt += " CRITICAL: You must strictly follow the user's additional instructions provided in the context. These override default behaviors."
+
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
@@ -221,7 +225,7 @@ def generate_essay(self, job_id: str):
         Suggest 4-6 logical body sections based on the topic."""
         
         requirements_response = api_call_with_retry(
-            client, job_id, extraction_prompt, content, max_tokens=1000
+            client, job_id, extraction_prompt, global_context, max_tokens=1000
         )
         
         try:
@@ -325,6 +329,7 @@ def generate_essay(self, job_id: str):
             - Develop arguments thoroughly - explain the significance of each point
             - Be thorough and expansive, not brief or superficial
             - Include relevant research, data, or scholarly perspectives where appropriate
+            - CRITICAL: Review the "USER ADDITIONAL INSTRUCTIONS" in the provided context and ensure this section aligns with any specific focus areas (e.g. specific country, theory, or case study).
             
             IMPORTANT: Return ONLY valid JSON in this exact format:
             {{"title": "{section_title}", "content": "<your detailed section text>"}}"""
