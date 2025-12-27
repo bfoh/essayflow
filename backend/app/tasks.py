@@ -196,10 +196,13 @@ def generate_essay(self, job_id: str):
         additional_prompt = job_data.get("additional_prompt", "")
         
         # Construct global context string
-        # This ensures additional instructions are ALWAYS present
-        global_context = f"Assignment Content: {content}\n\n"
+        # IMPORTANT: Put additional prompts FIRST so they are not lost in long context
+        global_context = ""
         if additional_prompt:
-            global_context += f"USER ADDITIONAL INSTRUCTIONS (CRITICAL - MUST FOLLOW): {additional_prompt}\n\n"
+            global_context += f"UPPERMOST PRIORITY - USER ADDITIONAL INSTRUCTIONS:\n{additional_prompt}\n\n"
+            global_context += "INSTRUCTION: The user's additional instructions above are CRITICAL. They override any conflicting information in the assignment content below.\n\n"
+        
+        global_context += f"Assignment Content: {content}\n\n"
         
         # Initialize OpenAI client for essay generation (Reverted due to Anthropic 404s)
         from openai import OpenAI
