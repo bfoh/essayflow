@@ -372,7 +372,7 @@ def generate_essay(self, job_id: str):
         
         conclusion_response = api_call_with_retry(
             client, job_id, conclusion_prompt,
-            f"Assignment: {content}",
+            global_context, # Updated context with images/additional prompt
             max_tokens=2000
         )
         
@@ -399,7 +399,7 @@ def generate_essay(self, job_id: str):
         
         references_response = api_call_with_retry(
             client, job_id, references_prompt,
-            f"Assignment: {content}",
+            global_context, # Updated context with images/additional prompt
             max_tokens=1500
         )
         
@@ -465,6 +465,11 @@ def humanize_essay(self, job_id: str):
         # Get humanization settings
         job_data = json.loads(redis_client.get(f"job:{job_id}"))
         settings = HumanizationSettings(**job_data.get("humanization_settings", {}))
+        additional_prompt = job_data.get("additional_prompt", "")
+        
+        # Get extracted content for context (including image analysis)
+        extracted_content = redis_client.get(f"job:{job_id}:content")
+        context_str = extracted_content.decode("utf-8") if extracted_content else ""
         
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -487,6 +492,9 @@ def humanize_essay(self, job_id: str):
         Humanization Intensity: {settings.intensity} (0=minimal, 1=aggressive)
         Preserve Citations: {settings.preserve_citations}
         
+        USER ADDITIONAL INSTRUCTIONS (CRITICAL - MUST FOLLOW FOR STYLE/TONE):
+        {additional_prompt if additional_prompt else "No additional style instructions."}
+        
         Maintain the essay's academic integrity, proper citations, and factual accuracy.
         
         Essay to humanize:
@@ -501,6 +509,7 @@ def humanize_essay(self, job_id: str):
                 response = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
+                        {"role": "system", "content": "You are an expert editor who humanizes AI-generated text. You MUST strictly follow the user's additional style instructions if provided."},
                         {"role": "user", "content": humanization_prompt}
                     ],
                     response_format={"type": "json_object"},
