@@ -1,0 +1,23 @@
+# System
+.DS_Store
+
+# Node
+node_modules/
+dist/
+.next/
+npm-debug.log*
+
+# Python
+backend/venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+! .env.example
+
+frontend/.git_backup/
