@@ -122,8 +122,10 @@ async def upload_file(
     # Generate job ID
     job_id = str(uuid.uuid4())
     
-    # Save file
+    # Save file (optional, mainly for debugging or backup if needed)
     file_path = os.path.join(UPLOAD_DIR, f"{job_id}{file_ext}")
+    
+    extracted_text = ""
     
     try:
         contents = await file.read()
@@ -135,17 +137,42 @@ async def upload_file(
                 detail="File size exceeds maximum limit of 10MB"
             )
         
+        # Save to disk (optional but good for debugging)
         with open(file_path, "wb") as f:
             f.write(contents)
         
         file_size = len(contents)
         
+        # Extract text immediately in the API (to avoid shared storage issues with Worker)
+        import io
+        
+        if file_ext == ".pdf":
+            import fitz  # PyMuPDF
+            # Open PDF from bytes
+            with fitz.open(stream=contents, filetype="pdf") as doc:
+                for page in doc:
+                    extracted_text += page.get_text()
+                    
+        elif file_ext == ".docx":
+            from docx import Document
+            # Open DOCX from bytes
+            with io.BytesIO(contents) as docx_stream:
+                doc = Document(docx_stream)
+                for para in doc.paragraphs:
+                    extracted_text += para.text + "\n"
+        
+        if not extracted_text.strip():
+             # Fallback or warning if text is empty? 
+             # For now, we proceed, the task will handle empty content if needed.
+             pass
+
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error processing file: {str(e)}") # Log error
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save file: {str(e)}"
+            detail=f"Failed to process file: {str(e)}"
         )
     
     # Create job record in Redis
@@ -155,8 +182,8 @@ async def upload_file(
         "progress": 0,
         "message": "Job created, waiting to start...",
         "filename": file.filename,
-        "file_path": file_path,
-        "file_type": file_ext[1:],  # Remove the dot
+        "file_path": file_path, # Kept for reference
+        "file_type": file_ext[1:],
         "created_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
         "student_name": student_name,
@@ -169,10 +196,10 @@ async def upload_file(
         "error": None
     }
     
-    redis_client.set(f"job:{job_id}", json.dumps(job_data), ex=86400)  # 24 hour expiry
+    redis_client.set(f"job:{job_id}", json.dumps(job_data), ex=86400)
     
-    # Start processing task
-    process_document.delay(job_id, file_path, file_ext[1:])
+    # Start processing task - PASS TEXT CONTENT, NOT PATH
+    process_document.delay(job_id, extracted_text)
     
     return FileUploadResponse(
         job_id=job_id,
@@ -235,31 +262,45 @@ async def download_essay(job_id: str, format: str = "pdf"):
             detail=f"Essay is not ready yet. Current status: {job['status']}"
         )
     
-    # Determine file path based on format
+    # Determine format and Redis key
     format = format.lower()
     if format == "docx":
-        file_path = os.path.join(UPLOAD_DIR, f"{job_id}_output.docx")
         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         extension = "docx"
+        redis_key = f"job:{job_id}:docx"
     else:
-        file_path = os.path.join(UPLOAD_DIR, f"{job_id}_output.pdf")
         media_type = "application/pdf"
         extension = "pdf"
+        redis_key = f"job:{job_id}:pdf"
     
-    if not os.path.exists(file_path):
+    # Retrieve file content from Redis
+    file_bytes = redis_client.get(redis_key)
+    
+    if not file_bytes:
+        # Fallback to filesystem if not in Redis (for legacy jobs or local dev)
+        # But clearly log that we are trying fallback
+        file_path = os.path.join(UPLOAD_DIR, f"{job_id}_output.{extension}")
+        if os.path.exists(file_path):
+             return FileResponse(
+                path=file_path,
+                media_type=media_type,
+                filename=f"{job.get('filename', 'essay')}_output.{extension}"
+            )
+            
         raise HTTPException(
             status_code=404,
-            detail=f"{extension.upper()} file not found"
+            detail=f"{extension.upper()} file not found (generation might have failed)"
         )
     
     # Get original filename without extension
     original_name = os.path.splitext(job.get("filename", "essay"))[0]
     output_filename = f"{original_name}_essay.{extension}"
     
-    return FileResponse(
-        path=file_path,
+    from fastapi.responses import Response
+    return Response(
+        content=file_bytes,
         media_type=media_type,
-        filename=output_filename
+        headers={"Content-Disposition": f"attachment; filename={output_filename}"}
     )
 
 

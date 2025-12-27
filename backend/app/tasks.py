@@ -97,33 +97,18 @@ def claude_api_call_with_retry(client, job_id, system_prompt, user_content, max_
 
 
 @celery_app.task(bind=True, name="app.tasks.process_document")
-def process_document(self, job_id: str, file_path: str, file_type: str):
+def process_document(self, job_id: str, extracted_text: str):
     """
-    Task to extract text from uploaded document.
-    Supports PDF and DOCX formats.
+    Task to process extracted text.
+    Text is now extracted in the API layer and passed here.
     """
     try:
-        update_job_status(job_id, JobStatus.EXTRACTING, 10, "Extracting text from document...")
-        
-        extracted_text = ""
-        
-        if file_type == "pdf":
-            import fitz  # PyMuPDF
-            doc = fitz.open(file_path)
-            for page in doc:
-                extracted_text += page.get_text()
-            doc.close()
-            
-        elif file_type == "docx":
-            from docx import Document
-            doc = Document(file_path)
-            for para in doc.paragraphs:
-                extracted_text += para.text + "\n"
+        update_job_status(job_id, JobStatus.EXTRACTING, 10, "Processing extracted text...")
         
         # Store extracted text
         redis_client.set(f"job:{job_id}:content", extracted_text, ex=86400)
         
-        update_job_status(job_id, JobStatus.EXTRACTING, 20, "Text extraction complete")
+        update_job_status(job_id, JobStatus.EXTRACTING, 20, "Text processing complete")
         
         # Chain to next task
         generate_essay.delay(job_id)
@@ -524,13 +509,13 @@ def generate_pdf(self, job_id: str):
         from reportlab.lib.units import inch
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
         from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+        import io
         
-        # Create PDF
-        output_path = os.path.join(UPLOAD_DIR, f"{job_id}_output.pdf")
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        # Create PDF in memory
+        pdf_buffer = io.BytesIO()
         
         doc = SimpleDocTemplate(
-            output_path,
+            pdf_buffer,
             pagesize=letter,
             rightMargin=1*inch,
             leftMargin=1*inch,
@@ -612,12 +597,15 @@ def generate_pdf(self, job_id: str):
         
         doc.build(story)
         
+        # Store PDF in Redis
+        pdf_bytes = pdf_buffer.getvalue()
+        redis_client.set(f"job:{job_id}:pdf", pdf_bytes, ex=86400)
+        
         # Generate DOCX version as well
         from docx import Document
         from docx.shared import Pt, Inches
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         
-        docx_path = os.path.join(UPLOAD_DIR, f"{job_id}_output.docx")
         docx_doc = Document()
         
         # Add header info
@@ -646,23 +634,29 @@ def generate_pdf(self, job_id: str):
         if essay.references:
             docx_doc.add_heading("References", level=2)
             for ref in essay.references:
-                docx_doc.add_paragraph(ref)
+                docx_doc.add_paragraph(ref, style='List Bullet')
+                
+        # Save DOCX to buffer and Redis
+        docx_buffer = io.BytesIO()
+        docx_doc.save(docx_buffer)
+        docx_bytes = docx_buffer.getvalue()
+        redis_client.set(f"job:{job_id}:docx", docx_bytes, ex=86400)
         
-        docx_doc.save(docx_path)
-        
-        # Store paths for both formats
+        # Update final status
         download_url = f"/api/download/{job_id}"
         
-        update_job_status(
-            job_id, 
-            JobStatus.COMPLETED, 
-            100, 
-            "Essay generation complete!",
-            download_url=download_url
-        )
+        # Update redis job record with download URL
+        job_data["status"] = JobStatus.COMPLETED.value
+        job_data["progress"] = 100
+        job_data["message"] = "Essay generation complete!"
+        job_data["download_url"] = download_url
+        job_data["updated_at"] = datetime.utcnow().isoformat()
         
-        return {"status": "success", "pdf_path": output_path, "docx_path": docx_path}
+        redis_client.set(f"job:{job_id}", json.dumps(job_data), ex=86400)
+        
+        return download_url
         
     except Exception as e:
-        update_job_status(job_id, JobStatus.FAILED, 0, error=str(e))
+        print(f"Error generating PDF: {str(e)}")
+        update_job_status(job_id, JobStatus.FAILED, 0, f"Failed to generate PDF: {str(e)}")
         raise
