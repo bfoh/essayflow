@@ -8,6 +8,7 @@ class JobStatus(str, Enum):
     """Status states for essay generation jobs."""
     PENDING = "pending"
     EXTRACTING = "extracting"
+    PLANNING = "planning"
     RESEARCHING = "researching"
     WRITING = "writing"
     HUMANIZING = "humanizing"

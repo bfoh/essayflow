@@ -6,6 +6,7 @@ import { FileSearch, BookOpen, Pen, Sparkles, CheckCircle2 } from 'lucide-react'
 export type JobStatus =
     | 'pending'
     | 'extracting'
+    | 'planning'
     | 'researching'
     | 'writing'
     | 'humanizing'
@@ -34,7 +35,7 @@ const steps: Step[] = [
     },
     {
         id: 'researching',
-        status: ['researching'],
+        status: ['planning', 'researching'],
         label: 'Research',
         icon: <BookOpen className="w-5 h-5" />,
     },
@@ -61,6 +62,7 @@ const steps: Step[] = [
 const statusOrder: JobStatus[] = [
     'pending',
     'extracting',
+    'planning',
     'researching',
     'writing',
     'humanizing',
