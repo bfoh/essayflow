@@ -38,6 +38,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://essayflo.netlify.app",
+        "https://essayflow.netlify.app",
         os.getenv("FRONTEND_URL", "http://localhost:3000")
     ],
     allow_credentials=True,
