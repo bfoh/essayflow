@@ -102,16 +102,16 @@ async def upload_file(
     student_name: Optional[str] = None,
     course_name: Optional[str] = None,
     humanization_intensity: float = 0.5,
-    additional_prompt: Optional[str] = None
+    additional_prompt: Optional[str] = None,
+    reference_image_0: Optional[UploadFile] = File(None),
+    reference_image_1: Optional[UploadFile] = File(None),
+    reference_image_2: Optional[UploadFile] = File(None),
+    reference_image_3: Optional[UploadFile] = File(None),
+    reference_image_4: Optional[UploadFile] = File(None)
 ):
     """
     Upload a document (PDF or DOCX) to start the essay generation process.
-    
-    - **file**: The assignment document (PDF or DOCX, max 10MB)
-    - **student_name**: Optional student name for PDF header
-    - **course_name**: Optional course name for PDF header
-    - **humanization_intensity**: Intensity of humanization (0.0-1.0)
-    - **additional_prompt**: Optional additional instructions or context
+    Also accepts up to 5 reference images.
     """
     # Validate file type
     allowed_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
@@ -149,7 +149,7 @@ async def upload_file(
         
         file_size = len(contents)
         
-        # Extract text immediately in the API (to avoid shared storage issues with Worker)
+        # Extract text immediately in the API
         import io
         
         if file_ext == ".pdf":
@@ -167,10 +167,23 @@ async def upload_file(
                 for para in doc.paragraphs:
                     extracted_text += para.text + "\n"
         
-        if not extracted_text.strip():
-             # Fallback or warning if text is empty? 
-             # For now, we proceed, the task will handle empty content if needed.
-             pass
+        # Handle Reference Images
+        ref_images = [
+            img for img in [reference_image_0, reference_image_1, reference_image_2, reference_image_3, reference_image_4]
+            if img is not None
+        ]
+        
+        image_count = 0
+        for idx, img in enumerate(ref_images):
+            try:
+                img_content = await img.read()
+                if len(img_content) > 0:
+                    # Store image in Redis for the worker to process
+                    # Use a key like job:{id}:ref_image:{idx}
+                    redis_client.set(f"job:{job_id}:ref_image:{idx}", img_content, ex=86400)
+                    image_count += 1
+            except Exception as e:
+                print(f"Failed to save reference image {idx}: {e}")
 
     except HTTPException:
         raise
@@ -195,6 +208,7 @@ async def upload_file(
         "student_name": student_name,
         "course_name": course_name,
         "additional_prompt": additional_prompt,
+        "ref_image_count": image_count, # Pass count to worker
         "humanization_settings": HumanizationSettings(
             intensity=humanization_intensity
         ).model_dump(),

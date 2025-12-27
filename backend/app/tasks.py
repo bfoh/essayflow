@@ -99,47 +99,103 @@ def claude_api_call_with_retry(client, job_id, system_prompt, user_content, max_
 @celery_app.task(bind=True, name="app.tasks.process_document")
 def process_document(self, job_id: str, extracted_text: str):
     """
-    Task to process extracted text.
-    Text is now extracted in the API layer and passed here.
+    Task to process extracted text and reference images.
     """
     try:
         update_job_status(job_id, JobStatus.EXTRACTING, 10, "Processing extracted text...")
         
+        # 1. Process Reference Images (if any)
+        job_data = json.loads(redis_client.get(f"job:{job_id}"))
+        ref_image_count = job_data.get("ref_image_count", 0)
+        image_analysis_text = ""
+        
+        if ref_image_count > 0:
+            update_job_status(job_id, JobStatus.EXTRACTING, 15, f"Analyzing {ref_image_count} reference images...")
+            import base64
+            
+            # Analyze images using GPT-4o Vision
+            vision_prompt = "Describe this image in detail. Focus on any data, charts, text, or key visual elements that are relevant for an academic essay."
+            
+            # Initialize OpenAI client
+            from openai import OpenAI
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            
+            for i in range(ref_image_count):
+                img_key = f"job:{job_id}:ref_image:{i}"
+                img_bytes = redis_client.get(img_key)
+                
+                if img_bytes:
+                    base64_image = base64.b64encode(img_bytes).decode('utf-8')
+                    
+                    try:
+                        response = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": vision_prompt},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                            }
+                                        }
+                                    ]
+                                }
+                            ],
+                            max_tokens=500
+                        )
+                        image_desc = response.choices[0].message.content
+                        image_analysis_text += f"\n\n[Analysis of Reference Image {i+1}]:\n{image_desc}"
+                    except Exception as e:
+                        print(f"Error analyzing image {i}: {e}")
+            
+        # Combine text and image analysis
+        full_content = extracted_text + "\n\n=== REFERENCE IMAGES ANALYSIS ===" + image_analysis_text
+        
         # Store extracted text
-        redis_client.set(f"job:{job_id}:content", extracted_text, ex=86400)
+        redis_client.set(f"job:{job_id}:content", full_content, ex=86400)
         
         update_job_status(job_id, JobStatus.EXTRACTING, 20, "Text processing complete")
         
         # Chain to next task
         generate_essay.delay(job_id)
         
-        return {"status": "success", "word_count": len(extracted_text.split())}
-        
+        return {"status": "success", "word_count": len(full_content.split())}
+
     except Exception as e:
-        update_job_status(job_id, JobStatus.FAILED, 0, error=str(e))
+        print(f"Error in process_document: {str(e)}")
+        update_job_status(job_id, JobStatus.FAILED, 0, f"Processing failed: {str(e)}")
         raise
 
 
 @celery_app.task(bind=True, name="app.tasks.generate_essay")
 def generate_essay(self, job_id: str):
     """
-    Task to generate essay draft using Claude 3.5 Sonnet.
-    Uses multi-pass generation for longer essays to meet word count requirements.
-    GPT-4o is kept for humanization (in humanize_essay task).
+    Task to generate draft essay structure and content.
+    Pass 1: Academic drafting.
     """
     try:
-        update_job_status(job_id, JobStatus.RESEARCHING, 30, "Analyzing assignment requirements...")
+        update_job_status(job_id, JobStatus.PLANNING, 30, "Analyzing requirements...")
         
         # Get extracted content
-        content = redis_client.get(f"job:{job_id}:content")
-        if not content:
+        extracted_text_bytes = redis_client.get(f"job:{job_id}:content")
+        if not extracted_text_bytes:
             raise ValueError("No extracted content found")
-        
-        content = content.decode("utf-8") if isinstance(content, bytes) else content
+            
+        content = extracted_text_bytes.decode("utf-8")
         
         # Get job settings
-        job_data = json.loads(redis_client.get(f"job:{job_id}"))
+        job_data_json = redis_client.get(f"job:{job_id}")
+        job_data = json.loads(job_data_json)
         additional_prompt = job_data.get("additional_prompt", "")
+        
+        # Construct global context string
+        # This ensures additional instructions are ALWAYS present
+        global_context = f"Assignment Content: {content}\n\n"
+        if additional_prompt:
+            global_context += f"USER ADDITIONAL INSTRUCTIONS (CRITICAL - MUST FOLLOW): {additional_prompt}\n\n"
         
         # Initialize OpenAI client for essay generation (Reverted due to Anthropic 404s)
         from openai import OpenAI
@@ -237,7 +293,7 @@ def generate_essay(self, job_id: str):
         
         intro_response = api_call_with_retry(
             client, job_id, intro_prompt, 
-            f"Assignment: {content}\n\nAdditional context: {additional_prompt}",
+            global_context, # Use updated universal context with image analysis & prompt
             max_tokens=3000
         )
         
@@ -275,7 +331,7 @@ def generate_essay(self, job_id: str):
             
             section_response = api_call_with_retry(
                 client, job_id, section_prompt,
-                f"Assignment: {content}\n\n{additional_prompt}",
+                global_context, # Updated context
                 max_tokens=4000
             )
             
