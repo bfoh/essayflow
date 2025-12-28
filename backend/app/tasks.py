@@ -262,6 +262,12 @@ def generate_essay(self, job_id: str):
                 if match:
                     target_word_count = int(match.group(1).replace(',', ''))
                     break
+            
+            # FORCE INJECTION: Add additional instructions to key_requirements
+            # This ensures downstream steps explicitly see them as requirements
+            if "key_requirements" not in requirements:
+                requirements["key_requirements"] = []
+            requirements["key_requirements"].append(f"USER PRIORITY INSTRUCTION: {additional_prompt}")
         
         # Filter out 'Conclusion' and 'References' from body sections to prevent duplicates
         # Also handle numbered sections like "5. Conclusion"
