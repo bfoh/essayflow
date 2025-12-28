@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -98,17 +98,18 @@ async def health_check():
 
 @app.post("/api/upload", response_model=FileUploadResponse)
 async def upload_file(
+    humanization_intensity: float = Form(0.5),
+    student_name: Optional[str] = Form(None),
+    course_name: Optional[str] = Form(None),
+    additional_prompt: Optional[str] = Form(None),
     file: UploadFile = File(...),
-    student_name: Optional[str] = None,
-    course_name: Optional[str] = None,
-    humanization_intensity: float = 0.5,
-    additional_prompt: Optional[str] = None,
     reference_image_0: Optional[UploadFile] = File(None),
     reference_image_1: Optional[UploadFile] = File(None),
     reference_image_2: Optional[UploadFile] = File(None),
     reference_image_3: Optional[UploadFile] = File(None),
     reference_image_4: Optional[UploadFile] = File(None)
 ):
+    
     """
     Upload a document (PDF or DOCX) to start the essay generation process.
     Also accepts up to 5 reference images.
