@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { FileSearch, BookOpen, Pen, Sparkles, CheckCircle2 } from 'lucide-react';
+import { FileSearch, BookOpen, Pen, Sparkles, Eye, CheckCircle2 } from 'lucide-react';
 
 export type JobStatus =
     | 'pending'
@@ -10,6 +10,8 @@ export type JobStatus =
     | 'researching'
     | 'writing'
     | 'humanizing'
+    | 'waiting_for_review'
+    | 'refining'
     | 'formatting'
     | 'completed'
     | 'failed';
@@ -47,13 +49,19 @@ const steps: Step[] = [
     },
     {
         id: 'humanizing',
-        status: ['humanizing', 'formatting'],
+        status: ['humanizing'],
         label: 'Humanize',
         icon: <Sparkles className="w-5 h-5" />,
     },
     {
+        id: 'reviewing',
+        status: ['waiting_for_review', 'refining'],
+        label: 'Review',
+        icon: <Eye className="w-5 h-5" />,
+    },
+    {
         id: 'completed',
-        status: ['completed'],
+        status: ['formatting', 'completed'],
         label: 'Done',
         icon: <CheckCircle2 className="w-5 h-5" />,
     },
@@ -66,6 +74,8 @@ const statusOrder: JobStatus[] = [
     'researching',
     'writing',
     'humanizing',
+    'waiting_for_review',
+    'refining',
     'formatting',
     'completed',
 ];

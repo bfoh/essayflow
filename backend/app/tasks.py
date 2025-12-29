@@ -552,15 +552,181 @@ def humanize_essay(self, job_id: str):
         # Store humanized version
         redis_client.set(f"job:{job_id}:humanized", humanized_essay.model_dump_json(), ex=86400)
         
-        update_job_status(job_id, JobStatus.HUMANIZING, 85, "Humanization complete")
-        
-        # Chain to PDF generation
-        generate_pdf.delay(job_id)
+        # STOP HERE: Do NOT chain to PDF generation.
+        # Set status to WAITING_FOR_REVIEW so user can read/edit.
+        update_job_status(job_id, JobStatus.WAITING_FOR_REVIEW, 85, "Ready for review")
         
         return {"status": "success"}
         
     except Exception as e:
         update_job_status(job_id, JobStatus.FAILED, 0, error=str(e))
+        raise
+
+
+
+@celery_app.task(bind=True, name="app.tasks.refine_essay")
+def refine_essay(self, job_id: str, instructions: str):
+    """
+    Task to refine an existing essay draft based on user feedback.
+    """
+    try:
+        update_job_status(job_id, JobStatus.REFINING, 85, "Refining essay...")
+        
+        # Get current humanized draft
+        essay_data_bytes = redis_client.get(f"job:{job_id}:humanized")
+        if not essay_data_bytes:
+            raise ValueError("No essay found to refine")
+            
+        essay_json = essay_data_bytes.decode("utf-8") if isinstance(essay_data_bytes, bytes) else essay_data_bytes
+        
+        # Calculate current word count for context
+        import json
+        essay_dict = json.loads(essay_json)
+        current_word_count = len(essay_dict.get('introduction', '').split()) + \
+                             len(essay_dict.get('conclusion', '').split()) + \
+                             sum(len(s.get('content', '').split()) for s in essay_dict.get('body_sections', []))
+        
+        # Initialize OpenAI client
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        refinement_prompt = f"""You are an expert academic editor.
+        
+        Refinement Instructions from User:
+        "{instructions}"
+
+        Current Essay Stats:
+        - REAL Word Count: {current_word_count} words (excluding references).
+        
+        Current Essay JSON:
+        {essay_json}
+        
+        Task:
+        1. If the user asks a question (e.g. "what is the word count?"), answer it in the 'ai_feedback' field and keep the essay content unchanged. USE THE 'REAL WORD COUNT' PROVIDED ABOVE.
+        2. If the user asks for edits (e.g., "Expand to 2500 words"), apply them to the essay content content (Introduction, Body Sections, Conclusion). You MUST significantly increase content if asked to expand.
+        3. Summarize what you did or answer the question in the 'ai_feedback' field.
+        4. Keep the JSON structure EXACTLY the same as the input schema, adding the 'ai_feedback' field at the root level.
+        5. Do NOT remove references unless explicitly asked.
+        6. Maintain academic tone unless asked to change it.
+
+        Example Output Structure:
+        {{
+            "title": "...",
+            "introduction": "...",
+            "body_sections": [...],
+            "conclusion": "...",
+            "references": [...],
+            "ai_feedback": "I have increased the word count by expanding the introduction..."
+        }}
+        
+        Return ONLY the valid updated JSON with the 'ai_feedback' field populated."""
+        
+        response = api_call_with_retry(
+            client, job_id, 
+            "You are an intelligent editor. Output valid JSON only.", 
+            refinement_prompt, 
+            max_tokens=4000
+        )
+        
+        # Validate and store
+        updated_data = json.loads(response)
+        updated_essay = EssayOutput(**updated_data)
+        
+        redis_client.set(f"job:{job_id}:humanized", updated_essay.model_dump_json(), ex=86400)
+        
+        update_job_status(job_id, JobStatus.WAITING_FOR_REVIEW, 85, "Refinement complete")
+        return {"status": "success"}
+
+    except Exception as e:
+        update_job_status(job_id, JobStatus.FAILED, 0, f"Refinement failed: {str(e)}")
+        raise
+
+
+@celery_app.task(bind=True, name="app.tasks.structure_essay")
+def structure_essay(self, job_id: str, raw_text: str, refinement_instructions: Optional[str] = None):
+    """
+    Takes raw text (from paste or file import) and structures it into
+    the EssayOutput JSON format so it can be edited/refined.
+    
+    If refinement_instructions are provided, it immediately triggers
+    a refinement task after structuring.
+    """
+    try:
+        update_job_status(job_id, JobStatus.PLANNING, 10, "Analyzing essay structure...")
+
+        # Initialize OpenAI client
+        # (This is safe because we are in a worker process)
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        if not raw_text or len(raw_text.strip()) < 50:
+            raise ValueError("Input text is too short to process")
+
+        structuring_prompt = f"""
+        You are an Essay Parser.
+        
+        TASK:
+        Take the following "Raw Essay Text" and structure it EXACTLY into the JSON schema provided below.
+        
+        RULES:
+        1. Identify the 'title' (if explicit, or create a simple one based on content).
+        2. Identify the 'thesis_statement' (usually the last sentence of the intro, or infer the main argument).
+        3. Identify the 'introduction' (first paragraphs).
+        4. Split the main body into logical 'body_sections' based on topic changes. Give each section a short 'title' summarizing its topic.
+        5. Identify the 'conclusion' (last paragraphs).
+        6. Extract the 'references' list. IMPORTANT: Capture the FULL reference entry (Author, Date, Title, Source) exactly as it appears or formatted in APA style. Do NOT just extract in-text citations like (Author, 2023). If no references section exists, return an empty list.
+        7. PRESERVE THE ORIGINAL TEXT CONTENT EXACTLY for the body.
+        
+        Raw Essay Text:
+        {raw_text[:15000]}  # Truncate to prevent token overflow if absurdly large, though 15k chars is plenty (~3000 words)
+
+        Output Schema:
+        {{
+            "title": "string",
+            "thesis_statement": "string (one sentence summary of main argument)",
+            "introduction": "string (multiline content)",
+            "body_sections": [
+                {{ "title": "Section Topic", "content": "string (multiline content)" }}
+            ],
+            "conclusion": "string (multiline content)",
+            "references": ["string (Full APA-style citation entry)"]
+        }}
+        """
+
+        response = api_call_with_retry(
+            client=client,
+            job_id=job_id,
+            system_prompt="You are a strict JSON formatter. Output ONLY valid JSON matching the schema.",
+            user_content=structuring_prompt
+        )
+
+        # Validate
+        import json
+        structured_data = json.loads(response)
+        
+        # Add basic metadata filler if missing
+        if "references" not in structured_data:
+            structured_data["references"] = []
+            
+        # Ensure it fits the Pydantic model
+        essay_output = EssayOutput(**structured_data)
+        
+        # Save to Redis as if it were a "humanized" essay ready for review
+        redis_client.set(f"job:{job_id}:humanized", essay_output.model_dump_json(), ex=86400)
+        
+        # Check if user wanted immediate refinement
+        if refinement_instructions and len(refinement_instructions.strip()) > 5:
+            update_job_status(job_id, JobStatus.REFINING, 20, "Structure complete. Applying initial refinement...")
+            # Chain the refinement task
+            refine_essay.delay(job_id, refinement_instructions)
+        else:
+            # Auto-advance to Review stage directly
+            update_job_status(job_id, JobStatus.WAITING_FOR_REVIEW, 100, "Import complete")
+        
+        return {"status": "success", "job_id": job_id}
+
+    except Exception as e:
+        update_job_status(job_id, JobStatus.FAILED, 0, f"Import failed: {str(e)}")
         raise
 
 
@@ -586,7 +752,7 @@ def generate_pdf(self, job_id: str):
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
         from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
         import io
         
@@ -630,12 +796,23 @@ def generate_pdf(self, job_id: str):
             firstLineIndent=0.5*inch
         )
         
+
         section_style = ParagraphStyle(
             'Section',
             parent=styles['Heading2'],
             fontSize=14,
             spaceBefore=18,
             spaceAfter=12
+        )
+
+        reference_style = ParagraphStyle(
+            'Reference',
+            parent=styles['Normal'],
+            fontSize=12,
+            leftIndent=0.5*inch,
+            firstLineIndent=-0.5*inch,
+            spaceAfter=6,
+            alignment=TA_JUSTIFY
         )
         
         # Build document content
@@ -655,24 +832,49 @@ def generate_pdf(self, job_id: str):
         story.append(Paragraph(essay.title, title_style))
         story.append(Spacer(1, 0.25*inch))
         
+        import html
+
+        def add_paragraphs(text: str, style):
+            """Helper to split text into proper paragraphs."""
+            if not text:
+                return
+            
+            # Normalize line endings
+            text = text.replace('\r\n', '\n').replace('\r', '\n')
+            
+            # Split by ANY newline to prevent "Mega Paragraphs" that get truncated
+            # ReportLab handles multiple Paragraph objects much better across pages
+            # than one giant Paragraph with <br/> tags.
+            paragraphs = text.split('\n')
+            
+            for p in paragraphs:
+                if not p.strip():
+                    continue
+                # Clean and add as separate paragraph
+                cleaned = html.escape(p.strip())
+                if cleaned:
+                    story.append(Paragraph(cleaned, style))
+
         # Introduction
-        story.append(Paragraph(essay.introduction, body_style))
+        add_paragraphs(essay.introduction, body_style)
         
         # Body sections
         for section in essay.body_sections:
-            story.append(Paragraph(section.title, section_style))
-            story.append(Paragraph(section.content, body_style))
+            story.append(Paragraph(html.escape(section.title), section_style))
+            add_paragraphs(section.content, body_style)
         
         # Conclusion
         story.append(Paragraph("Conclusion", section_style))
-        story.append(Paragraph(essay.conclusion, body_style))
+        add_paragraphs(essay.conclusion, body_style)
         
         # References
         if essay.references:
             story.append(Spacer(1, 0.5*inch))
+             # ... continue with references logic (will need to verify references code too)
             story.append(Paragraph("References", section_style))
             for ref in essay.references:
-                story.append(Paragraph(ref, body_style))
+                story.append(Paragraph(html.escape(ref), reference_style))
+
         
         doc.build(story)
         

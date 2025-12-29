@@ -9,6 +9,9 @@ import os
 import redis
 from datetime import datetime
 from typing import Optional
+import io
+import fitz # PyMuPDF
+from docx import Document
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,9 +21,11 @@ from app.schemas import (
     TaskStatusResponse, 
     FileUploadResponse,
     JobCreateRequest,
-    HumanizationSettings
+    HumanizationSettings,
+    EssayRefinementRequest,
+    EssayOutput
 )
-from app.tasks import process_document
+from app.tasks import process_document, refine_essay, generate_pdf, structure_essay
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -222,10 +227,109 @@ async def upload_file(
     # Start processing task - PASS TEXT CONTENT, NOT PATH
     process_document.delay(job_id, extracted_text)
     
+    
     return FileUploadResponse(
         job_id=job_id,
         message="File uploaded successfully. Processing started.",
         filename=file.filename,
+        file_size=file_size
+    )
+
+
+@app.post("/api/import_essay", response_model=FileUploadResponse)
+async def import_essay(
+    file: Optional[UploadFile] = File(None),
+    text_content: Optional[str] = Form(None),
+    refinement_instructions: Optional[str] = Form(None)
+):
+    """
+    Import an existing essay (via file or text paste) for refinement.
+    Bypasses generation and goes straight to structuring -> review.
+    If refinement_instructions are present, we auto-trigger the refinement task.
+    """
+    print(f"DEBUG: Processing import request. File: {file.filename if file else 'None'}, Content: {len(text_content) if text_content else 0}")
+
+    if not file and not text_content:
+        raise HTTPException(status_code=400, detail="Must provide either a file or text content")
+
+    job_id = str(uuid.uuid4())
+    filename = "imported_essay"
+    file_size = 0
+    extracted_text = ""
+
+    try:
+        if file:
+            filename = file.filename
+            file_ext = os.path.splitext(filename)[1].lower()
+            if file_ext not in [".pdf", ".docx"]:
+                raise HTTPException(status_code=400, detail="Only PDF and DOCX files supported")
+            
+            print(f"DEBUG: Reading file {filename}...")
+            contents = await file.read()
+            file_size = len(contents)
+            print(f"DEBUG: File read. Size: {file_size} bytes")
+            
+            if file_ext == ".pdf":
+                print("DEBUG: Extracting PDF...")
+                with fitz.open(stream=contents, filetype="pdf") as doc:
+                    for page_num, page in enumerate(doc):
+                        extracted_text += page.get_text()
+                print(f"DEBUG: PDF Extracted {len(extracted_text)} chars")
+            elif file_ext == ".docx":
+                print("DEBUG: Extracting DOCX...")
+                with io.BytesIO(contents) as docx_stream:
+                    doc = Document(docx_stream)
+                    for para in doc.paragraphs:
+                        extracted_text += para.text + "\n"
+                print(f"DEBUG: DOCX Extracted {len(extracted_text)} chars")
+        
+        else:
+            # Text paste
+            print("DEBUG: Using pasted text")
+            extracted_text = text_content
+            file_size = len(extracted_text.encode('utf-8'))
+            filename = "pasted_text.txt"
+
+        if len(extracted_text.strip()) < 50:
+             raise HTTPException(status_code=400, detail="Extracted text is too short or empty")
+
+    except Exception as e:
+        print(f"ERROR in import_essay: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to process import: {str(e)}")
+
+    # Create job record
+    job_data = {
+        "job_id": job_id,
+        "status": JobStatus.PENDING.value,
+        "progress": 0,
+        "message": "Importing essay...",
+        "filename": filename,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+        "student_name": "Student", # Default placeholders
+        "course_name": "Course",
+        "humanization_settings": {"intensity": 0.5}, # Default
+        "download_url": None,
+        "error": None
+    }
+    
+    print(f"DEBUG: Setting job {job_id} in Redis")
+    redis_client.set(f"job:{job_id}", json.dumps(job_data), ex=86400)
+    
+    # Store the raw content for reference
+    redis_client.set(f"job:{job_id}:content", extracted_text, ex=86400)
+    
+    # Trigger Structuring Task, passing optional instructions
+    print(f"DEBUG: Triggering structure_essay task with instructions: {refinement_instructions} type:{type(refinement_instructions)}")
+    structure_essay.delay(job_id, extracted_text, refinement_instructions)
+    print("DEBUG: Task triggered.")
+    
+    return FileUploadResponse(
+        job_id=job_id,
+        message="Essay imported successfully. Structuring...",
+        filename=filename,
         file_size=file_size
     )
 
@@ -367,6 +471,48 @@ async def get_essay_content(job_id: str):
         "essay": essay,
         "original_content": original_text
     }
+
+
+@app.get("/api/job/{job_id}/review", response_model=EssayOutput)
+async def get_essay_for_review(job_id: str):
+    """
+    Get the humanized essay content for review.
+    """
+    essay_data = redis_client.get(f"job:{job_id}:humanized")
+    if not essay_data:
+        raise HTTPException(status_code=404, detail="Essay not ready for review")
+    
+    return json.loads(essay_data)
+
+
+@app.post("/api/job/{job_id}/refine")
+async def refine_essay_endpoint(job_id: str, request: EssayRefinementRequest):
+    """
+    Submit instructions to refine the essay.
+    """
+    # Verify job exists
+    if not redis_client.exists(f"job:{job_id}"):
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # Trigger refinement task
+    refine_essay.delay(job_id, request.instructions)
+    
+    return {"status": "refining", "message": "Refinement task started"}
+
+
+@app.post("/api/job/{job_id}/finalize")
+async def finalize_essay(job_id: str):
+    """
+    Approve the essay and generate the final PDF/DOCX.
+    """
+    # Verify job exists
+    if not redis_client.exists(f"job:{job_id}"):
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # Trigger PDF generation
+    generate_pdf.delay(job_id)
+    
+    return {"status": "finalizing", "message": "PDF generation started"}
 
 
 if __name__ == "__main__":

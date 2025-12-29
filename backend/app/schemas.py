@@ -12,6 +12,8 @@ class JobStatus(str, Enum):
     RESEARCHING = "researching"
     WRITING = "writing"
     HUMANIZING = "humanizing"
+    WAITING_FOR_REVIEW = "waiting_for_review"  # New state: Essay ready, waiting for user approval
+    REFINING = "refining"                      # New state: Applying user requested edits
     FORMATTING = "formatting"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -68,6 +70,7 @@ class EssayOutput(BaseModel):
     references: Optional[List[str]] = None
     total_word_count: Optional[int] = None  # Optional as GPT may not always return this
     academic_level: Optional[str] = Field(default="undergraduate", description="e.g., undergraduate, graduate, doctoral")
+    ai_feedback: Optional[str] = Field(None, description="Message from AI to user explaining changes or answering questions")
     
     class Config:
         json_schema_extra = {
@@ -118,3 +121,9 @@ class ExtractedContent(BaseModel):
     detected_rubrics: Optional[List[str]] = None
     detected_requirements: Optional[List[str]] = None
     file_type: str
+
+
+class EssayRefinementRequest(BaseModel):
+    """Request schema for refining an essay."""
+    instructions: str = Field(..., description="User instructions for refinement")
+
